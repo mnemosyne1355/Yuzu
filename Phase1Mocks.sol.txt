@@ -1,0 +1,357 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {
+    IUnlockCallback,
+    PoolKey,
+    ModifyLiquidityParams,
+    SwapParams,
+    IPoolManager,
+    IHooks,
+    IWETH,
+    IYuzuUnits,
+    V4StateLib
+} from "../../src/interfaces/IYuzuV4Interfaces.sol";
+
+contract MockWETH is ERC20, IWETH {
+    constructor() ERC20("Wrapped Ether", "WETH") {}
+
+    function deposit() external payable override {
+        _mint(msg.sender, msg.value);
+    }
+
+    function withdraw(uint256 amount) external override {
+        _burn(msg.sender, amount);
+        (bool ok,) = msg.sender.call{value: amount}("");
+        require(ok, "ETH_TRANSFER_FAILED");
+    }
+
+    function transfer(address to, uint256 value) public override(ERC20, IWETH) returns (bool) {
+        return super.transfer(to, value);
+    }
+
+    function transferFrom(address from, address to, uint256 value) public override(ERC20, IWETH) returns (bool) {
+        return super.transferFrom(from, to, value);
+    }
+
+    function balanceOf(address account) public view override(ERC20, IWETH) returns (uint256) {
+        return super.balanceOf(account);
+    }
+
+    function approve(address spender, uint256 value) public override(ERC20, IWETH) returns (bool) {
+        return super.approve(spender, value);
+    }
+}
+
+contract MockYuzuUnits is IYuzuUnits {
+    mapping(uint256 => address) public ownerOf;
+    mapping(uint256 => bool) public isGutted;
+    mapping(uint256 => address) public getVaultAddress;
+    mapping(address => bool) public isVault;
+    uint256 public commissionedCount;
+    uint256 public firstPublicCommissionAt;
+
+    function setUnit(uint256 tokenId, address owner, address vault, bool gutted) external {
+        ownerOf[tokenId] = owner;
+        getVaultAddress[tokenId] = vault;
+        isVault[vault] = true;
+        isGutted[tokenId] = gutted;
+    }
+
+    function setCommissioned(uint256 count, uint256 firstPublicTs) external {
+        commissionedCount = count;
+        firstPublicCommissionAt = firstPublicTs;
+    }
+}
+
+/// @notice Full-range constant-product (x * y = k, 1.00% fee) stand-in for the Uniswap v4 PoolManager.
+/// @dev REWRITTEN (bankr 2026-11-18, v4 alignment pass) to the real PoolManager's calling convention:
+///      - sync(currency) then settle(): settle credits only what actually arrived since sync;
+///      - every swap, liquidity change, settle and take is booked as a per-caller currency delta, and unlock()
+///        reverts with CurrencyNotSettled unless every delta is back to zero (the old mock's settle did nothing);
+///      - swap returns one packed BalanceDelta, modifyLiquidity returns (callerDelta, feesAccrued) packed;
+///      - liquidityDelta is in real liquidity units (amounts come from the pool price, not from hookData);
+///      - slot0 is read through extsload at keccak256(abi.encodePacked(poolId, uint256(6)));
+///      - a swap price limit of 0, or one on the wrong side of the price, reverts as it does on real v4.
+///      Still NOT real v4: one fee tier (1.00%) for every pool, no tick math (tick stays 0 unless a test sets it),
+///      the price limit is validated but never binds, fees go to whichever position asks first, liquidity cannot
+///      be removed, and hooks are called whenever key.hooks is set (real v4 looks at the hook address flags and
+///      wraps a hook's revert in its own error).
+contract MockV4PoolManager is IPoolManager {
+    struct PoolState {
+        uint160 sqrtPriceX96;
+        int24 tick;
+        uint256 reserve0;
+        uint256 reserve1;
+        uint256 fees0;
+        uint256 fees1;
+        bool initialized;
+    }
+
+    uint160 internal constant MIN_SQRT_PRICE = 4295128739;
+    uint160 internal constant MAX_SQRT_PRICE = 1461446703485210103287273052203988822378723970342;
+
+    mapping(bytes32 => PoolState) public pools;
+    mapping(bytes32 poolId => mapping(address owner => uint256 liquidity)) public positionLiquidity;
+    mapping(address target => mapping(address currency => int256 delta)) public currencyDelta;
+    mapping(bytes32 slot => bytes32 poolId) internal _slotToPool;
+    uint256 public nonzeroDeltaCount;
+    bool public unlocked;
+    address public syncedCurrency;
+    uint256 public syncedReserves;
+
+    error NotUnlocked();
+    error AlreadyUnlocked();
+    error CurrencyNotSettled();
+    error PoolNotInitialized();
+    error PoolAlreadyInitialized();
+    error PriceLimitAlreadyExceeded(uint160 sqrtPriceCurrentX96, uint160 sqrtPriceLimitX96);
+    error PriceLimitOutOfBounds(uint160 sqrtPriceLimitX96);
+    error CannotUpdateEmptyPosition();
+    error RemoveLiquidityNotSupported();
+
+    function initialize(PoolKey calldata key, uint160 sqrtPriceX96) external override returns (int24 tick) {
+        bytes32 id = keccak256(abi.encode(key));
+        if (pools[id].initialized) revert PoolAlreadyInitialized();
+        if (key.hooks != address(0)) {
+            IHooks(key.hooks).beforeInitialize(msg.sender, key, sqrtPriceX96);
+        }
+        pools[id].sqrtPriceX96 = sqrtPriceX96;
+        pools[id].tick = 0;
+        pools[id].initialized = true;
+        _slotToPool[keccak256(abi.encodePacked(id, uint256(6)))] = id;
+        return 0;
+    }
+
+    function unlock(bytes calldata data) external override returns (bytes memory res) {
+        if (unlocked) revert AlreadyUnlocked();
+        unlocked = true;
+        res = IUnlockCallback(msg.sender).unlockCallback(data);
+        if (nonzeroDeltaCount != 0) revert CurrencyNotSettled();
+        unlocked = false;
+    }
+
+    function modifyLiquidity(
+        PoolKey calldata key,
+        ModifyLiquidityParams calldata params,
+        bytes calldata hookData
+    ) external override returns (int256 callerDelta, int256 feesAccrued) {
+        if (!unlocked) revert NotUnlocked();
+        bytes32 id = keccak256(abi.encode(key));
+        PoolState storage p = pools[id];
+        if (!p.initialized) revert PoolNotInitialized();
+        if (params.liquidityDelta < 0) revert RemoveLiquidityNotSupported();
+        // Real v4 calls beforeAddLiquidity only for a positive delta; a zero delta (fee collection) does not.
+        if (params.liquidityDelta > 0 && key.hooks != address(0)) {
+            IHooks(key.hooks).beforeAddLiquidity(msg.sender, key, params, hookData);
+        }
+
+        uint256 liq = uint256(params.liquidityDelta);
+        uint256 owned = positionLiquidity[id][msg.sender];
+        if (liq == 0 && owned == 0) revert CannotUpdateEmptyPosition();
+
+        uint256 f0 = 0;
+        uint256 f1 = 0;
+        if (owned > 0) {
+            f0 = p.fees0;
+            f1 = p.fees1;
+            p.fees0 = 0;
+            p.fees1 = 0;
+        }
+
+        uint256 a0 = 0;
+        uint256 a1 = 0;
+        if (liq > 0) {
+            // Full-range amounts for `liq` at the current price, rounded up as v4 rounds what the caller owes
+            a0 = Math.mulDiv(liq, 1 << 96, p.sqrtPriceX96, Math.Rounding.Ceil);
+            a1 = Math.mulDiv(liq, p.sqrtPriceX96, 1 << 96, Math.Rounding.Ceil);
+            p.reserve0 += a0;
+            p.reserve1 += a1;
+            positionLiquidity[id][msg.sender] = owned + liq;
+        }
+
+        int128 d0 = int128(int256(f0)) - int128(int256(a0));
+        int128 d1 = int128(int256(f1)) - int128(int256(a1));
+        callerDelta = V4StateLib.packDelta(d0, d1);
+        feesAccrued = V4StateLib.packDelta(int128(int256(f0)), int128(int256(f1)));
+        _account(key.currency0, msg.sender, d0);
+        _account(key.currency1, msg.sender, d1);
+    }
+
+    function swap(
+        PoolKey calldata key,
+        SwapParams calldata params,
+        bytes calldata hookData
+    ) external override returns (int256 swapDelta) {
+        if (!unlocked) revert NotUnlocked();
+        bytes32 id = keccak256(abi.encode(key));
+        PoolState storage p = pools[id];
+        if (!p.initialized) revert PoolNotInitialized();
+        if (key.hooks != address(0)) {
+            IHooks(key.hooks).beforeSwap(msg.sender, key, params, hookData);
+        }
+
+        if (params.zeroForOne) {
+            if (params.sqrtPriceLimitX96 >= p.sqrtPriceX96) {
+                revert PriceLimitAlreadyExceeded(p.sqrtPriceX96, params.sqrtPriceLimitX96);
+            }
+            if (params.sqrtPriceLimitX96 <= MIN_SQRT_PRICE) revert PriceLimitOutOfBounds(params.sqrtPriceLimitX96);
+        } else {
+            if (params.sqrtPriceLimitX96 <= p.sqrtPriceX96) {
+                revert PriceLimitAlreadyExceeded(p.sqrtPriceX96, params.sqrtPriceLimitX96);
+            }
+            if (params.sqrtPriceLimitX96 >= MAX_SQRT_PRICE) revert PriceLimitOutOfBounds(params.sqrtPriceLimitX96);
+        }
+
+        int256 amount0Delta;
+        int256 amount1Delta;
+
+        // 1.00% fee constant-product math
+        if (params.amountSpecified > 0) {
+            // Exact output
+            uint256 amountOut = uint256(params.amountSpecified);
+            if (params.zeroForOne) {
+                // Token0 in, Token1 out
+                require(amountOut < p.reserve1, "INSUFFICIENT_LIQ_1");
+                uint256 netIn = (p.reserve0 * amountOut) / (p.reserve1 - amountOut) + 1;
+                uint256 grossIn = (netIn * 10000) / 9900 + 1;
+                p.reserve0 += netIn;
+                p.reserve1 -= amountOut;
+                p.fees0 += grossIn - netIn;
+                amount0Delta = -int256(grossIn);
+                amount1Delta = int256(amountOut);
+            } else {
+                // Token1 in, Token0 out
+                require(amountOut < p.reserve0, "INSUFFICIENT_LIQ_0");
+                uint256 netIn = (p.reserve1 * amountOut) / (p.reserve0 - amountOut) + 1;
+                uint256 grossIn = (netIn * 10000) / 9900 + 1;
+                p.reserve1 += netIn;
+                p.reserve0 -= amountOut;
+                p.fees1 += grossIn - netIn;
+                amount0Delta = int256(amountOut);
+                amount1Delta = -int256(grossIn);
+            }
+        } else {
+            // Exact input
+            uint256 grossIn = uint256(-params.amountSpecified);
+            uint256 netIn = (grossIn * 9900) / 10000;
+            if (params.zeroForOne) {
+                uint256 amountOut = (p.reserve1 * netIn) / (p.reserve0 + netIn);
+                p.reserve0 += netIn;
+                p.reserve1 -= amountOut;
+                p.fees0 += grossIn - netIn;
+                amount0Delta = -int256(grossIn);
+                amount1Delta = int256(amountOut);
+            } else {
+                uint256 amountOut = (p.reserve0 * netIn) / (p.reserve1 + netIn);
+                p.reserve1 += netIn;
+                p.reserve0 -= amountOut;
+                p.fees1 += grossIn - netIn;
+                amount0Delta = int256(amountOut);
+                amount1Delta = -int256(grossIn);
+            }
+        }
+
+        // The price follows the reserves, so slot0 reads see the post-swap price
+        if (p.reserve0 > 0 && p.reserve1 > 0) {
+            p.sqrtPriceX96 = uint160(Math.sqrt((p.reserve1 << 128) / p.reserve0) << 32);
+        }
+
+        swapDelta = V4StateLib.packDelta(int128(amount0Delta), int128(amount1Delta));
+        _account(key.currency0, msg.sender, amount0Delta);
+        _account(key.currency1, msg.sender, amount1Delta);
+    }
+
+    function sync(address currency) external override {
+        syncedCurrency = currency;
+        syncedReserves = currency == address(0) ? 0 : ERC20(currency).balanceOf(address(this));
+    }
+
+    function settle() external payable override returns (uint256 paid) {
+        if (!unlocked) revert NotUnlocked();
+        address currency = syncedCurrency;
+        if (currency == address(0)) {
+            paid = msg.value;
+        } else {
+            paid = ERC20(currency).balanceOf(address(this)) - syncedReserves;
+            syncedCurrency = address(0);
+        }
+        _account(currency, msg.sender, int256(paid));
+    }
+
+    function take(address currency, address to, uint256 amount) external override {
+        if (!unlocked) revert NotUnlocked();
+        _account(currency, msg.sender, -int256(amount));
+        ERC20(currency).transfer(to, amount);
+    }
+
+    /// @dev Only the slot0 word of an initialized pool is served: sqrtPriceX96 in the low 160 bits, tick above it.
+    function extsload(bytes32 slot) external view override returns (bytes32 value) {
+        PoolState storage p = pools[_slotToPool[slot]];
+        return bytes32(uint256(p.sqrtPriceX96) | (uint256(uint24(p.tick)) << 160));
+    }
+
+    function setTickForTest(bytes32 poolId, int24 newTick) external {
+        pools[poolId].tick = newTick;
+    }
+
+    function _account(address currency, address target, int256 d) internal {
+        if (d == 0) return;
+        int256 prev = currencyDelta[target][currency];
+        int256 next = prev + d;
+        currencyDelta[target][currency] = next;
+        if (prev == 0) nonzeroDeltaCount++;
+        else if (next == 0) nonzeroDeltaCount--;
+    }
+}
+
+/// @dev ADDED (bankr 2026-11-18, v4 alignment pass). Test helper that supplies full-range liquidity the way a v4
+///      integrator has to: real liquidity units inside unlock(), then sync -> transfer -> settle() for what it
+///      owes. Fund it with both tokens first; whatever rounding leaves over stays here.
+contract FullRangeLpHelper is IUnlockCallback {
+    IPoolManager public immutable pm;
+
+    constructor(IPoolManager pm_) {
+        pm = pm_;
+    }
+
+    /// @notice The sqrtPriceX96 at which amt0 of currency0 is worth amt1 of currency1.
+    function sqrtPriceFor(uint256 amt0, uint256 amt1) public pure returns (uint160) {
+        return uint160(Math.sqrt((amt1 << 128) / amt0) << 32);
+    }
+
+    function addFullRange(PoolKey memory key, uint256 amt0, uint256 amt1) external returns (uint128 liquidity) {
+        (uint160 sqrtPriceX96,) = V4StateLib.getSlot0(pm, keccak256(abi.encode(key)));
+        liquidity = V4StateLib.fullRangeLiquidityForAmounts(sqrtPriceX96, amt0, amt1);
+        pm.unlock(abi.encode(key, liquidity));
+    }
+
+    function unlockCallback(bytes calldata data) external override returns (bytes memory) {
+        require(msg.sender == address(pm), "ONLY_POOL_MANAGER");
+        (PoolKey memory key, uint128 liquidity) = abi.decode(data, (PoolKey, uint128));
+        int24 maxTick = (887272 / key.tickSpacing) * key.tickSpacing;
+        (int256 callerDelta,) = pm.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({
+                tickLower: -maxTick,
+                tickUpper: maxTick,
+                liquidityDelta: int256(uint256(liquidity)),
+                salt: bytes32(0)
+            }),
+            ""
+        );
+        (int128 d0, int128 d1) = V4StateLib.unpackDelta(callerDelta);
+        _pay(key.currency0, d0);
+        _pay(key.currency1, d1);
+        return "";
+    }
+
+    function _pay(address currency, int128 d) internal {
+        if (d >= 0) return;
+        pm.sync(currency);
+        ERC20(currency).transfer(address(pm), uint256(uint128(-d)));
+        pm.settle();
+    }
+}

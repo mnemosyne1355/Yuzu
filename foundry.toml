@@ -1,0 +1,16 @@
+[profile.default]
+src = "src"
+out = "out"
+test = "test"
+libs = ["node_modules", "lib"]
+solc_version = "0.8.24"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+# 1,000 full standalone vaults deployed in one simulated run() need more gas than forge's default limit
+gas_limit = 30000000000
+remappings = [
+  "@openzeppelin/contracts/=node_modules/@openzeppelin/contracts/",
+  "forge-std/=lib/forge-std-1.9.6/src/"
+]

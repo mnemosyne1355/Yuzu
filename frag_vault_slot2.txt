@@ -1,0 +1,43 @@
+    // =========================================================================
+    // 6b. SLOT 2 WIRING (collateral pull for YuzuCartridge and Tier-3 desk-policy loosening, Section 6.2)
+    // =========================================================================
+
+    /// @notice Hands a priced asset to YuzuCartridge for a covered call or a cash-leg move. Only the cartridge can
+    ///         call it, and only to itself. The cartridge checks the caller, the desk policy and the venue; the vault
+    ///         re-checks the freeze, the Listing Bolt (Fence F7) and the seed reserve against its own balance.
+    function pullSlot2Asset(address asset, uint256 amount, address to) external nonReentrant {
+        if (msg.sender != cartridge || to != cartridge) revert OnlyCartridge();
+        if (guardianFrozen || mainframe.boltState(tokenId) != BoltState.UNBOLTED) revert VaultNotLive();
+        if (!registry.isPricedAsset(asset)) revert UnpricedOrSeedAssetInFastLane();
+        IERC20(asset).safeTransfer(to, amount);
+        _requireSeedReserve();
+    }
+
+    /// @notice Tier-3 action 11: sets or loosens the unit's Slot-2 desk policy in YuzuCartridge. Authorized by a
+    ///         Guardian co-signature or the 48h queue over (ACTION_LOOSEN_DESK_POLICY, cartridge, address(0), 0,
+    ///         keccak256(abi.encode(allowedAssets, minStrikeBps, minPremiumBps, maxExpirySeconds, maxExposureShareBps))).
+    function loosenDeskPolicy(
+        address[] calldata allowedAssets,
+        uint16 minStrikeBps,
+        uint16 minPremiumBps,
+        uint32 maxExpirySeconds,
+        uint16 maxExposureShareBps,
+        uint256 deadline,
+        bytes calldata guardianSig
+    ) external onlyOwner nonReentrant {
+        if (mainframe.isGutted(tokenId) || mainframe.boltState(tokenId) != BoltState.UNBOLTED) revert VaultNotLive();
+        _authorizeTier3(
+            ACTION_LOOSEN_DESK_POLICY,
+            cartridge,
+            address(0),
+            0,
+            keccak256(abi.encode(allowedAssets, minStrikeBps, minPremiumBps, maxExpirySeconds, maxExposureShareBps)),
+            deadline,
+            guardianSig
+        );
+        IYuzuCartridgePolicy(cartridge).setPolicyFromVaultTier3(
+            tokenId, allowedAssets, minStrikeBps, minPremiumBps, maxExpirySeconds, maxExposureShareBps
+        );
+        emit Tier3ActionExecuted(ACTION_LOOSEN_DESK_POLICY, cartridge, address(0), 0);
+    }
+

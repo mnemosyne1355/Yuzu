@@ -1,0 +1,14 @@
+        // CHANGE (bankr 2026-11-18, v4 alignment): the mock now takes real liquidity units and makes the provider
+        // pay what it owes, so the pool opens at the price the two amounts imply ($500 per wSPYx) and a helper
+        // contract supplies and settles the liquidity.
+        uint256 amt0 = c0 == address(usdg) ? 500_000e6 : 1_000e18;
+        uint256 amt1 = c0 == address(usdg) ? 1_000e18  : 500_000e6;
+        FullRangeLpHelper lp = new FullRangeLpHelper(poolManager);
+        poolManager.initialize(qKey, lp.sqrtPriceFor(amt0, amt1));
+        poolId = keccak256(abi.encode(qKey));
+        usdgIs0 = c0 == address(usdg);
+        usdg.mint(address(lp), 500_000e6);
+        wspyx.mint(address(lp), 1_000e18);
+        lp.addFullRange(qKey, amt0, amt1);
+    }
+

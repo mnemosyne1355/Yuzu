@@ -1,0 +1,43 @@
+
+    // ---------------------------------------------------------------------------------------------------------
+    // The swap leg now runs in the companion: same numbers, nothing left behind, fences still hold
+    // ---------------------------------------------------------------------------------------------------------
+
+    function test_SwapLeg_RunsInCompanion_NoResidue_FencesHold() public {
+        bytes[] memory emptyPyth;
+
+        // WETH -> wSPYx, fee on the input leg: 0.1 WETH in, 0.00025 WETH fee split 80/20 in the real Treasury
+        vm.prank(owner);
+        vault.executeTier1Swap(address(weth), address(wspyx), 0.1 ether, emptyPyth);
+        assertEq(weth.balanceOf(address(vault)), 0.9 ether);
+        assertEq(weth.balanceOf(address(distributor)), 0.0002 ether);
+        assertEq(treasury.buybackWethReserve(), 0.00005 ether);
+        // 0.09975 WETH = $199.50 -> 0.399 wSPYx fair, less the router's 0.30%
+        assertEq(wspyx.balanceOf(address(vault)), 0.397803 ether);
+
+        // wSPYx -> USDG, fee on the output leg (never in the xStock): 99.7 USDG gross, 0.24925 USDG fee
+        vm.prank(owner);
+        vault.executeTier1Swap(address(wspyx), address(usdg), 0.2 ether, emptyPyth);
+        assertEq(wspyx.balanceOf(address(vault)), 0.197803 ether);
+        assertEq(usdg.balanceOf(address(vault)), 1_099_450_750);
+        assertEq(treasury.feeEscrow(address(usdg)), 249_250);
+        assertEq(treasury.feeEscrowBuybackShare(address(usdg)), 49_850);
+
+        // Nothing is left in the companion and the vault gave it no approval
+        assertEq(weth.balanceOf(address(companion)), 0);
+        assertEq(wspyx.balanceOf(address(companion)), 0);
+        assertEq(usdg.balanceOf(address(companion)), 0);
+        assertEq(weth.allowance(address(vault), address(companion)), 0);
+        assertEq(wspyx.allowance(address(vault), address(companion)), 0);
+
+        // Fence F3 still holds: 0.5 WETH is over 20% of Liquid NAV, and the whole call rolls back
+        vm.prank(owner);
+        vm.expectRevert(YuzuAccount.FenceF3ExposureCapExceeded.selector);
+        vault.executeTier1Swap(address(weth), address(wspyx), 0.5 ether, emptyPyth);
+        assertEq(weth.balanceOf(address(vault)), 0.9 ether);
+
+        // A stranger cannot use the swap leg on tokens that are not there
+        vm.prank(stranger);
+        vm.expectRevert(YuzuAccountCompanion.SwapNotFunded.selector);
+        companion.swapFor(address(weth), address(wspyx), 0.1 ether, 9900, true, 3000e18);
+    }

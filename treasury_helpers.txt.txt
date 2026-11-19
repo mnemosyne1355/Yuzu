@@ -1,0 +1,39 @@
+    /// @dev v4 alignment pass (argon, 2026-11-18). The $YUZU and WETH held by the locked full-range position at
+    ///      the pool's current price. Only the Treasury can add liquidity (the hook enforces it), so this is the
+    ///      whole pool. Replaces getPositionBalances, which the real PoolManager does not have.
+    function _getPoolBalances() internal view returns (uint256 poolYuzu, uint256 poolWeth) {
+        (uint160 sqrtPriceX96,) = V4StateLib.getSlot0(poolManager, poolId);
+        (uint256 bal0, uint256 bal1) = V4StateLib.fullRangeAmountsForLiquidity(sqrtPriceX96, lockedLiquidity);
+        poolYuzu = yuzuIsCurrency0 ? bal0 : bal1;
+        poolWeth = yuzuIsCurrency0 ? bal1 : bal0;
+    }
+
+    /// @dev Adds full-range liquidity and debits the LP reserve by what the position actually took, so rounding
+    ///      leftovers stay in the reserve (argon, 2026-11-18).
+    ///      FIX (bankr 2026-11-18): on real v4 an add also pays out the fees the position has accrued, netted
+    ///      against what is owed. As pasted, those fees stayed inside the LP reserve. They are split here exactly
+    ///      like collectLpFees.
+    function _addLiquidity(uint256 wethToUse, uint256 yuzuToUse) internal returns (uint256 wethPaid, uint256 yuzuPaid) {
+        bytes memory res = poolManager.unlock(abi.encode(CallbackAction.ADD_LIQUIDITY, wethToUse, yuzuToUse));
+        uint256 feeWeth;
+        uint256 feeYuzu;
+        (wethPaid, yuzuPaid, feeWeth, feeYuzu) = abi.decode(res, (uint256, uint256, uint256, uint256));
+        lpReserveWethPending -= wethPaid;
+        lpReserveYuzuRemaining -= yuzuPaid;
+        totalYuzuAddedToLp += yuzuPaid;
+        _distributeLpFees(feeWeth, feeYuzu);
+    }
+
+    /// @dev LP fee split: WETH 50% to YuzuDistributor and 50% to Treasury funds; $YUZU 100% to YuzuDistributor.
+    function _distributeLpFees(uint256 wethFees, uint256 yuzuFees) internal {
+        if (wethFees == 0 && yuzuFees == 0) return;
+        uint256 wethToDist = wethFees / 2;
+        uint256 wethToTreas = wethFees - wethToDist;
+
+        if (wethToDist > 0) weth.transfer(distributor, wethToDist);
+        if (wethToTreas > 0) treasuryWethFunds += wethToTreas;
+        if (yuzuFees > 0) yuzuToken.transfer(distributor, yuzuFees);
+
+        emit LpFeesCollected(wethToDist, wethToTreas, yuzuFees);
+    }
+

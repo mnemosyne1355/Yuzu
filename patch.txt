@@ -1,0 +1,378 @@
+@@@ foundry.toml
+<<<<
+via_ir = true
+====
+via_ir = true
+# 1,000 full standalone vaults deployed in one simulated run() need more gas than forge's default limit
+gas_limit = 30000000000
+>>>>
+@@@ src/YuzuSeeder.sol
+<<<<
+    bool public unitZeroCommissioned;
+====
+    bool public unitZeroCommissioned;
+    /// @notice CHANGE (founder 2026-11-18): the account that deployed this contract. Only it may commission #0000,
+    ///         so nobody can take #0000 between the wiring transactions and the #0000 transaction.
+    address public immutable deployer = msg.sender;
+>>>>
+<<<<
+    error UnitZeroAlreadyCommissioned();
+====
+    error UnitZeroAlreadyCommissioned();
+    error OnlyDeployer();
+>>>>
+<<<<
+    ) external payable nonReentrant {
+        if (unitZeroCommissioned) revert UnitZeroAlreadyCommissioned();
+====
+    ) external payable nonReentrant {
+        if (msg.sender != deployer) revert OnlyDeployer();
+        if (unitZeroCommissioned) revert UnitZeroAlreadyCommissioned();
+>>>>
+@@@ test/YuzuPhase3.t.sol
+<<<<
+        vm.deal(founder, 10 ether);
+        vm.prank(founder);
+        seeder.commissionFounderUnitZero{value: 0.15 ether}(founder, address(0x10), address(0x20), emptyPyth);
+====
+        vm.deal(founder, 10 ether);
+        // CHANGE (2026-11-18): #0000 may only be commissioned by the Seeder's deployer (this test contract).
+        // The wiring is done and #0000 is not minted yet, which is the front-run window: an outsider is refused.
+        vm.deal(address(0xBAD), 1 ether);
+        vm.prank(address(0xBAD));
+        vm.expectRevert(YuzuSeeder.OnlyDeployer.selector);
+        seeder.commissionFounderUnitZero{value: 0.15 ether}(address(0xBAD), address(0x10), address(0x20), emptyPyth);
+        seeder.commissionFounderUnitZero{value: 0.15 ether}(founder, address(0x10), address(0x20), emptyPyth);
+>>>>
+@@@ script/DeployYuzu98V50.s.sol
+<<<<
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
+import {PoolKey} from "../src/interfaces/IYuzuV4Interfaces.sol";
+====
+import {PoolKey} from "../src/interfaces/IYuzuV4Interfaces.sol";
+>>>>
+<<<<
+import {YuzuAccount} from "../src/YuzuAccount.sol";
+====
+import {YuzuAccount} from "../src/YuzuAccount.sol";
+
+/// @dev CHANGE (founder 2026-11-18): added so step 15 can add the Pyth update fee to #0000's payment.
+interface IPythUpdateFee {
+    function getUpdateFee(bytes[] calldata updateData) external view returns (uint256);
+}
+>>>>
+<<<<
+    // FIX (bankr 2026-11-18): added. The paste set maxAgeSeconds 3600 on every asset; kept as one constant.
+    uint32 public constant DEFAULT_MAX_AGE_SECONDS = 3600;
+====
+    // CHANGE (founder 2026-11-18): per-asset freshness windows. 24h for the crypto legs (WETH, kBTC, USDG),
+    // 1h for wSPYx. The lens applies the window to both the Chainlink and the Pyth timestamp.
+    uint32 public constant CRYPTO_MAX_AGE_SECONDS = 86_400;
+    uint32 public constant XSTOCK_MAX_AGE_SECONDS = 3_600;
+    uint256 public constant UNIT_ZERO_PRICE = 0.15 ether;
+>>>>
+<<<<
+        uint256 initialVaultBatchCount; // Defaults to 1000 (full fleet) on run()
+        bool useEip1167Clones;          // If true, deploys 1 master YuzuAccount implementation and clones 1,000 immutable EIP-1167 instances
+====
+        uint256 initialVaultBatchCount; // Defaults to 1000 (full fleet) on run()
+        // CHANGE (founder 2026-11-18): the EIP-1167 clone flag is removed. Every vault is a full standalone
+        // YuzuAccount, so there is no delegatecall anywhere in the stack.
+>>>>
+<<<<
+        YuzuSeeder seeder;
+        address masterVaultImplementation;
+        address[] deployedVaults;
+====
+        YuzuSeeder seeder;
+        address[] deployedVaults;
+>>>>
+<<<<
+    /// @notice Builds the standard 4 initial priced assets (WETH, kBTC, USDG, wSPYx) and 7 verified routes.
+====
+    /// @notice Builds the standard 4 initial priced assets (WETH, kBTC, USDG, wSPYx) and 8 routes.
+>>>>
+<<<<
+        assets[0] = _assetInput(weth,  true,  false, 18, ethClFeed,  ethPythId);
+        assets[1] = _assetInput(kbtc,  true,  false, 8,  btcClFeed,  btcPythId);
+        assets[2] = _assetInput(usdg,  true,  false, 6,  usdgClFeed, usdgPythId);
+        // As pasted: wSPYx is NOT flagged as an ERC-4626 wrapper (isWrapper false). See DEPLOY_SCRIPT_NOTES.md.
+        assets[3] = _assetInput(wspyx, false, false, 18, spyClFeed,  spyPythId);
+
+        routes = new YuzuRegistry.InitialRouteInput[](7);
+====
+        assets[0] = _assetInput(weth,  true,  false, 18, CRYPTO_MAX_AGE_SECONDS, ethClFeed,  ethPythId);
+        assets[1] = _assetInput(kbtc,  true,  false, 8,  CRYPTO_MAX_AGE_SECONDS, btcClFeed,  btcPythId);
+        assets[2] = _assetInput(usdg,  true,  false, 6,  CRYPTO_MAX_AGE_SECONDS, usdgClFeed, usdgPythId);
+        // CHANGE (founder 2026-11-18): wSPYx is flagged as an ERC-4626 wrapper, so the lens multiplies the SPY
+        // feed by wSPYx.convertToAssets(1 share). The token at WSPYX_TOKEN must implement convertToAssets.
+        assets[3] = _assetInput(wspyx, false, true,  18, XSTOCK_MAX_AGE_SECONDS, spyClFeed,  spyPythId);
+
+        routes = new YuzuRegistry.InitialRouteInput[](8);
+>>>>
+<<<<
+        routes[6] = _routeInput(usdg,  weth,  swapRouter);
+====
+        routes[6] = _routeInput(usdg,  weth,  swapRouter);
+        // CHANGE (founder 2026-11-18): 8th route. Salvage routing and fee/salvage conversion look up
+        // asset -> WETH, and kBTC is in every US_BASKET seed.
+        routes[7] = _routeInput(kbtc,  weth,  swapRouter);
+>>>>
+<<<<
+        uint8 decimals_,
+        address chainlinkFeed,
+        bytes32 pythFeedId
+    ) internal pure returns (YuzuRegistry.InitialAssetInput memory a) {
+====
+        uint8 decimals_,
+        uint32 maxAge_,
+        address chainlinkFeed,
+        bytes32 pythFeedId
+    ) internal pure returns (YuzuRegistry.InitialAssetInput memory a) {
+>>>>
+<<<<
+            maxAge: DEFAULT_MAX_AGE_SECONDS,
+====
+            maxAge: maxAge_,
+>>>>
+<<<<
+        p.initialVaultBatchCount = vm.envOr("INITIAL_VAULT_BATCH", uint256(1000));
+        p.useEip1167Clones = vm.envOr("USE_EIP1167_VAULT_CLONES", true);
+====
+        p.initialVaultBatchCount = vm.envOr("INITIAL_VAULT_BATCH", uint256(1000));
+>>>>
+<<<<
+        p.pythUpdateData = new bytes[](0);
+====
+        // CHANGE (founder 2026-11-18): optional Pyth update for #0000's commissioning, as one hex blob.
+        // Empty means no update is sent and the on-chain Pyth prices must already be inside their windows.
+        bytes memory pythUpdateHex = vm.envOr("PYTH_UPDATE_HEX", bytes(""));
+        if (pythUpdateHex.length > 0) {
+            p.pythUpdateData = new bytes[](1);
+            p.pythUpdateData[0] = pythUpdateHex;
+        } else {
+            p.pythUpdateData = new bytes[](0);
+        }
+>>>>
+<<<< RANGE
+        if (p.useEip1167Clones) {
+----
+                if (i == 0) d.masterVaultImplementation = address(v);
+            }
+        }
+====
+        // CHANGE (founder 2026-11-18): full standalone vaults only. The EIP-1167 clone path is removed, so there
+        // is no delegatecall anywhere in the stack. On a broadcast each vault is its own transaction.
+        for (uint256 i = 0; i < p.initialVaultBatchCount; i++) {
+            YuzuAccount v = new YuzuAccount(
+                address(d.mainframe),
+                address(d.lens),
+                address(d.registry),
+                address(d.socketBay),
+                address(d.distributor),
+                address(d.treasury),
+                address(d.hook),
+                p.pyth,
+                p.weth,
+                address(d.yuzuToken),
+                address(d.seeder),
+                address(d.cartridge),
+                address(d.rsAdapter),
+                address(d.companion)
+            );
+            d.deployedVaults[i] = address(v);
+        }
+>>>>
+<<<<
+        if (txSender.balance < 0.15 ether) {
+            revert InsufficientEthForUnitZero(txSender.balance, 0.15 ether);
+        }
+        d.seeder.commissionFounderUnitZero{value: 0.15 ether}(
+====
+        // CHANGE (founder 2026-11-18): the Seeder charges 0.15 ETH plus the Pyth update fee, so the fee is added
+        // when update data is supplied (sending exactly 0.15 ETH would revert). The Seeder only accepts this
+        // call from the account that deployed it, which is the account sending these transactions.
+        uint256 unitZeroValue = UNIT_ZERO_PRICE;
+        if (p.pythUpdateData.length > 0) {
+            unitZeroValue += IPythUpdateFee(p.pyth).getUpdateFee(p.pythUpdateData);
+        }
+        if (txSender.balance < unitZeroValue) {
+            revert InsufficientEthForUnitZero(txSender.balance, unitZeroValue);
+        }
+        d.seeder.commissionFounderUnitZero{value: unitZeroValue}(
+>>>>
+@@@ test/YuzuFull17Integration.t.sol
+<<<<
+import {MockChainlinkFeed, MockPyth, MockERC20Asset as MockERC20Dec} from "./mocks/Phase2Mocks.sol";
+====
+import {MockChainlinkFeed, MockPyth, MockERC20Asset as MockERC20Dec, MockXStockWrapper} from "./mocks/Phase2Mocks.sol";
+>>>>
+<<<<
+///      hook mask 0x2880, EIP-1167 vault clones, run() reading the environment). Argon's original single test
+====
+///      hook mask 0x2880, run() reading the environment). Updated 2026-11-18 12:46Z for the founder's decisions:
+///      full standalone vaults (clone path removed), 8 routes, wSPYx as a wrapper, 24h / 1h freshness windows,
+///      PYTH_UPDATE_HEX and the Seeder's deployer check on #0000. Argon's original single test
+>>>>
+<<<<
+    MockERC20Dec wspyx;
+====
+    MockERC20Dec spyx;
+    MockXStockWrapper wspyx;
+>>>>
+<<<<
+        wspyx = new MockERC20Dec("Wrapped SPYx", "wSPYx", 18);
+====
+        // CHANGE (2026-11-18): wSPYx is registered as an ERC-4626 wrapper, so the mock has to be one. This uses
+        // the existing MockXStockWrapper (adjustable multiplier) and leaves the plain token mock unchanged.
+        spyx = new MockERC20Dec("SPYx", "SPYx", 18);
+        wspyx = new MockXStockWrapper("Wrapped SPYx", "wSPYx", 18, address(spyx));
+>>>>
+<<<<
+    function _params(bool useClones, uint256 vaultCount)
+====
+    function _params(uint256 vaultCount)
+>>>>
+<<<<
+        p.initialVaultBatchCount = vaultCount;
+        p.useEip1167Clones = useClones;
+====
+        p.initialVaultBatchCount = vaultCount;
+>>>>
+<<<<
+        assertLt(d.masterVaultImplementation.code.length, EIP170_LIMIT, "YuzuAccount > 24,576 B");
+        assertGt(d.masterVaultImplementation.code.length, 20_000, "YuzuAccount implementation missing");
+====
+        assertLt(d.deployedVaults[0].code.length, EIP170_LIMIT, "YuzuAccount > 24,576 B");
+        assertGt(d.deployedVaults[0].code.length, 20_000, "full standalone vault expected");
+>>>>
+<<<<
+        // The vault's own storage was set up by the Seeder (matters for clones, which run no constructor)
+====
+        // The vault's own storage was set up by the Seeder
+>>>>
+<<<< RANGE
+    /// @notice Argon's original test: direct call, one full YuzuAccount per vault (no clones), 5 vaults.
+----
+    /// @notice The real deploy path: run() reading the environment, sending from a private key, with the hook
+====
+    function _cfg(YuzuRegistry r, address a) internal view returns (bool isWrapper, uint32 maxAge) {
+        (,, isWrapper,,, maxAge,,) = r.assetConfigs(a);
+    }
+
+    /// @notice Argon's original test: direct call, 5 full standalone vaults.
+    function test_All17Contracts_DeployUnderEip170Limit_AndOpenPoolWithUnitZero() public {
+        DeployYuzu98V50.DeployParams memory p = _params(5);
+        DeployYuzu98V50.DeployedContracts memory d = deployerScript.deployAndWireAll17(p);
+
+        _assertSizes(d);
+        assertGt(d.deployedVaults[4].code.length, 20_000, "full vault expected");
+        _assertUnitZeroAndPool(d);
+        _publicMintUnitOne(d);
+    }
+
+    /// @notice Founder decisions of 2026-11-18: 8 routes including kBTC -> WETH, wSPYx priced as an ERC-4626
+    ///         wrapper, 24h / 1h freshness windows, and #0000 commissionable only by the Seeder's deployer.
+    function test_RegistryDefaults_WrapperPricing_AndUnitZeroCallerCheck() public {
+        DeployYuzu98V50.DeployParams memory p = _params(2);
+        assertEq(p.initialRoutes.length, 8, "route count");
+        DeployYuzu98V50.DeployedContracts memory d = deployerScript.deployAndWireAll17(p);
+
+        // kBTC -> WETH is registered and active
+        assertTrue(d.registry.routeFor(address(kbtc), address(weth)).isActive, "kBTC -> WETH route");
+        assertEq(d.registry.routeFor(address(kbtc), address(weth)).router, address(router), "kBTC -> WETH router");
+
+        // Freshness windows and the wrapper flag
+        (bool w, uint32 age) = _cfg(d.registry, address(weth));
+        assertFalse(w, "WETH is not a wrapper");
+        assertEq(age, 86_400, "WETH maxAge");
+        (w, age) = _cfg(d.registry, address(kbtc));
+        assertEq(age, 86_400, "kBTC maxAge");
+        (w, age) = _cfg(d.registry, address(usdg));
+        assertEq(age, 86_400, "USDG maxAge");
+        (w, age) = _cfg(d.registry, address(wspyx));
+        assertTrue(w, "wSPYx is a wrapper");
+        assertEq(age, 3_600, "wSPYx maxAge");
+
+        // wSPYx is priced at the SPY feed times convertToAssets(1 share)
+        assertEq(d.lens.requireFresh(address(wspyx)), 500e18, "wSPYx at 1.00x");
+        wspyx.setMultiplier(1.05e18);
+        assertEq(d.lens.requireFresh(address(wspyx)), 525e18, "wSPYx at 1.05x");
+
+        // #0000 can only be commissioned by the account that deployed the Seeder (here the script contract)
+        assertEq(d.seeder.deployer(), address(deployerScript), "seeder deployer");
+        vm.deal(alice, 1 ether);
+        vm.prank(alice);
+        vm.expectRevert(YuzuSeeder.OnlyDeployer.selector);
+        d.seeder.commissionFounderUnitZero{value: 0.15 ether}(alice, guardian, recovery, new bytes[](0));
+
+        // Two hours later with no feed update: WETH is still inside its 24h window, wSPYx is outside its 1h window
+        vm.warp(block.timestamp + 2 hours);
+        d.lens.requireFresh(address(weth));
+        vm.expectRevert();
+        d.lens.requireFresh(address(wspyx));
+    }
+
+    /// @notice Measures the execution gas of deploying one full standalone vault (code storage included,
+    ///         transaction calldata and the L1 data fee not included).
+    function test_GasPerStandaloneVault() public {
+        DeployYuzu98V50.DeployedContracts memory d = deployerScript.deployAndWireAll17(_params(1));
+        uint256 g = gasleft();
+        YuzuAccount v = new YuzuAccount(
+            address(d.mainframe),
+            address(d.lens),
+            address(d.registry),
+            address(d.socketBay),
+            address(d.distributor),
+            address(d.treasury),
+            address(d.hook),
+            address(pyth),
+            address(weth),
+            address(d.yuzuToken),
+            address(d.seeder),
+            address(d.cartridge),
+            address(d.rsAdapter),
+            address(d.companion)
+        );
+        uint256 used = g - gasleft();
+        emit log_named_uint("GAS_PER_VAULT", used);
+        emit log_named_uint("VAULT_RUNTIME_BYTES", address(v).code.length);
+        assertLt(used, 10_000_000, "vault deploy gas");
+    }
+
+    /// @notice The real deploy path: run() reading the environment, sending from a private key, with the hook
+>>>>
+<<<<
+        vm.setEnv("SWAP_ROUTER", vm.toString(address(router)));
+====
+        vm.setEnv("SWAP_ROUTER", vm.toString(address(router)));
+        // CHANGE (2026-11-18): optional Pyth update blob. MockPyth charges 1 wei per blob and ignores its content,
+        // so this checks the fee is added to #0000's payment, not that real Pyth data is accepted.
+        vm.setEnv("PYTH_UPDATE_HEX", "0x1234");
+        // Vault count for this simulated run. 40 by default to keep the test light; set YUZU_TEST_RUN_BATCH=1000
+        // in the shell to run the full fleet of standalone vaults.
+        uint256 runBatch = vm.envOr("YUZU_TEST_RUN_BATCH", uint256(40));
+        vm.setEnv("INITIAL_VAULT_BATCH", vm.toString(runBatch));
+>>>>
+<<<<
+        assertEq(d.deployedVaults.length, 1000, "vault count");
+        assertEq(d.mainframe.getVaultAddress(999), d.deployedVaults[999], "vault #0999 registered");
+        _assertUnitZeroAndPool(d);
+====
+        assertEq(d.deployedVaults.length, runBatch, "vault count");
+        assertEq(d.mainframe.getVaultAddress(runBatch - 1), d.deployedVaults[runBatch - 1], "last vault registered");
+        assertTrue(d.mainframe.isYuzuVault(d.deployedVaults[runBatch - 1]), "last vault flagged");
+        assertGt(d.deployedVaults[runBatch - 1].code.length, 20_000, "last vault is a full standalone vault");
+        assertEq(d.seeder.deployer(), eoa, "seeder deployed by the broadcasting key");
+        _assertUnitZeroAndPool(d);
+>>>>
+<<<<
+        assertEq(eoa.balance, 1 ether - 0.15 ether, "deployer paid 0.15 ETH");
+====
+        assertEq(eoa.balance, 1 ether - 0.15 ether - 1, "deployer paid 0.15 ETH + 1 wei Pyth fee");
+>>>>
+<<<<
+        DeployYuzu98V50.DeployParams memory p = _params(true, 1);
+====
+        DeployYuzu98V50.DeployParams memory p = _params(1);
+>>>>

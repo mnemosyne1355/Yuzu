@@ -1,0 +1,110 @@
+    // ---- Non-WETH fee and salvage escrows (Sections 2.4 and 9.1) ----
+
+    uint256 public constant ESCROW_MIN_OUT_BPS = 9850;     // 98.50% of the oracle quote
+    uint256 public constant DESK_FEE_BUYBACK_BPS = 2000;   // desk fee: 80% reward pool, 20% buyback
+    uint256 public constant SKIM_BUYBACK_BPS = 5000;       // Slot-2 skim: 50% reward pool, 50% buyback
+
+    /// @notice Credits a desk fee taken in a non-WETH asset. The caller must have transferred `amount` here first.
+    function receiveFeeEscrow(address asset, uint256 amount) external nonReentrant {
+        _creditFeeEscrow(asset, amount, DESK_FEE_BUYBACK_BPS);
+    }
+
+    /// @notice Credits a Slot-2 skim taken in a non-WETH asset. The caller must have transferred `amount` here first.
+    function receiveSkimEscrow(address asset, uint256 amount) external nonReentrant {
+        _creditFeeEscrow(asset, amount, SKIM_BUYBACK_BPS);
+    }
+
+    /// @notice Credits a Seed Raid salvage share that could not be swapped. The caller must have transferred it first.
+    function receiveSalvageEscrow(address asset, uint256 amount) external nonReentrant {
+        _requireEscrowFunded(asset, amount);
+        salvageEscrow[asset] += amount;
+        emit SalvageEscrowReceived(asset, amount);
+    }
+
+    /// @notice Anyone can call. Swaps the whole fee escrow of `asset` to WETH at no less than 98.5% of the oracle
+    ///         quote and splits it between the reward pool and the buyback reserve in the proportions it was
+    ///         collected in. Send the Pyth update fee as msg.value; any excess is returned.
+    function convertFees(address asset, bytes[] calldata pythUpdateData)
+        external
+        payable
+        nonReentrant
+        returns (uint256 wethOut)
+    {
+        uint256 amount = feeEscrow[asset];
+        if (amount == 0) revert NothingToConvert();
+        uint256 buybackShare = feeEscrowBuybackShare[asset];
+        feeEscrow[asset] = 0;
+        feeEscrowBuybackShare[asset] = 0;
+
+        wethOut = _convertEscrow(asset, amount, pythUpdateData);
+
+        uint256 toBuyback = (wethOut * buybackShare) / amount;
+        uint256 toDist = wethOut - toBuyback;
+        if (toDist > 0) weth.transfer(distributor, toDist);
+        buybackWethReserve += toBuyback;
+        emit FeesConverted(asset, amount, wethOut, toDist, toBuyback);
+    }
+
+    /// @notice Anyone can call. Swaps the whole salvage escrow of `asset` to WETH on the same terms and sends all
+    ///         of it to YuzuDistributor.
+    function convertSalvage(address asset, bytes[] calldata pythUpdateData)
+        external
+        payable
+        nonReentrant
+        returns (uint256 wethOut)
+    {
+        uint256 amount = salvageEscrow[asset];
+        if (amount == 0) revert NothingToConvert();
+        salvageEscrow[asset] = 0;
+
+        wethOut = _convertEscrow(asset, amount, pythUpdateData);
+        weth.transfer(distributor, wethOut);
+        emit SalvageConverted(asset, amount, wethOut);
+    }
+
+    function _creditFeeEscrow(address asset, uint256 amount, uint256 buybackBps) internal {
+        _requireEscrowFunded(asset, amount);
+        feeEscrow[asset] += amount;
+        feeEscrowBuybackShare[asset] += (amount * buybackBps) / 10000;
+        emit FeeEscrowReceived(asset, amount, buybackBps);
+    }
+
+    /// @dev Credit is only given for tokens that are actually here and not already counted, so these functions can
+    ///      stay open to any caller. WETH and $YUZU are refused because the Treasury holds ring-fenced balances of both.
+    function _requireEscrowFunded(address asset, uint256 amount) internal view {
+        if (asset == address(weth) || asset == address(yuzuToken)) revert EscrowAssetNotAllowed();
+        if (IERC20(asset).balanceOf(address(this)) < salvageEscrow[asset] + feeEscrow[asset] + amount) {
+            revert EscrowNotFunded();
+        }
+    }
+
+    function _convertEscrow(address asset, uint256 amount, bytes[] calldata pythUpdateData)
+        internal
+        returns (uint256 wethOut)
+    {
+        uint256 pythFee = 0;
+        if (pythUpdateData.length > 0) {
+            IPythMinimal p = IPythMinimal(lens.pyth());
+            pythFee = p.getUpdateFee(pythUpdateData);
+            if (msg.value < pythFee) revert PythFeeShort();
+            p.updatePriceFeeds{value: pythFee}(pythUpdateData);
+        }
+        if (msg.value > pythFee) {
+            (bool ok,) = msg.sender.call{value: msg.value - pythFee}("");
+            if (!ok) revert RefundFailed();
+        }
+
+        lens.requireFresh(asset);
+        lens.requireFresh(address(weth));
+        uint256 minWeth = (lens.quote(asset, address(weth), amount) * ESCROW_MIN_OUT_BPS) / 10000;
+        if (minWeth == 0) revert ConvertOutputShort();
+
+        IYuzuRegistry.Route memory r = registry.routeFor(asset, address(weth));
+        uint256 before = weth.balanceOf(address(this));
+        IERC20(asset).forceApprove(r.router, amount);
+        IYuzuSwapRouter(r.router).swapExactIn(asset, address(weth), amount, minWeth, address(this), r.path);
+        IERC20(asset).forceApprove(r.router, 0);
+        wethOut = weth.balanceOf(address(this)) - before;
+        if (wethOut < minWeth) revert ConvertOutputShort();
+    }
+

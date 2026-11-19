@@ -1,0 +1,82 @@
+    /// @dev v4 alignment pass (argon, 2026-11-18): real liquidity units, packed BalanceDelta returns, valid price
+    ///      limits, and sync -> transfer -> settle() to pay the PoolManager.
+    ///      FIX (bankr 2026-11-18): ADD_LIQUIDITY and COLLECT_FEES share one branch (a collect is an add of zero)
+    ///      and both return (wethIntoPosition, yuzuIntoPosition, feeWeth, feeYuzu), so fees paid out during an
+    ///      add are reported separately from what the position took.
+    function unlockCallback(bytes calldata data) external override returns (bytes memory) {
+        if (msg.sender != address(poolManager)) revert OnlyPoolManager();
+        (CallbackAction action, uint256 amountWeth, uint256 amountYuzu) =
+            abi.decode(data, (CallbackAction, uint256, uint256));
+
+        if (action != CallbackAction.BUYBACK) {
+            uint128 liq = 0;
+            if (action == CallbackAction.ADD_LIQUIDITY) {
+                (uint160 sqrtPriceX96,) = V4StateLib.getSlot0(poolManager, poolId);
+                liq = V4StateLib.fullRangeLiquidityForAmounts(
+                    sqrtPriceX96,
+                    yuzuIsCurrency0 ? amountYuzu : amountWeth,
+                    yuzuIsCurrency0 ? amountWeth : amountYuzu
+                );
+                lockedLiquidity += liq;
+            }
+
+            (int256 callerDelta, int256 feesAccrued) = poolManager.modifyLiquidity(
+                poolKey,
+                ModifyLiquidityParams({
+                    tickLower: FULL_RANGE_TICK_LOWER,
+                    tickUpper: FULL_RANGE_TICK_UPPER,
+                    liquidityDelta: int256(uint256(liq)),
+                    salt: bytes32(0)
+                }),
+                ""
+            );
+            // callerDelta = fees paid out minus what the position took. Negative: the Treasury owes the
+            // PoolManager. Positive: the PoolManager owes the Treasury.
+            (int128 d0, int128 d1) = V4StateLib.unpackDelta(callerDelta);
+            (int128 f0, int128 f1) = V4StateLib.unpackDelta(feesAccrued);
+            _settleOrTake(poolKey.currency0, d0);
+            _settleOrTake(poolKey.currency1, d1);
+
+            uint256 into0 = uint256(int256(f0) - int256(d0));
+            uint256 into1 = uint256(int256(f1) - int256(d1));
+            uint256 fee0 = uint256(uint128(f0));
+            uint256 fee1 = uint256(uint128(f1));
+            return yuzuIsCurrency0 ? abi.encode(into1, into0, fee1, fee0) : abi.encode(into0, into1, fee0, fee1);
+        }
+
+        // CallbackAction.BUYBACK: exact-input swap of amountWeth for $YUZU delivered to YuzuDistributor
+        bool zeroForOne = !yuzuIsCurrency0;
+        int256 swapDelta = poolManager.swap(
+            poolKey,
+            SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: -int256(amountWeth),
+                sqrtPriceLimitX96: zeroForOne
+                    ? V4StateLib.MIN_SQRT_PRICE_PLUS_ONE
+                    : V4StateLib.MAX_SQRT_PRICE_MINUS_ONE
+            }),
+            ""
+        );
+        (int128 s0, int128 s1) = V4StateLib.unpackDelta(swapDelta);
+        int128 yuzuDelta = yuzuIsCurrency0 ? s0 : s1;
+        uint256 yuzuOut = yuzuDelta > 0 ? uint256(uint128(yuzuDelta)) : 0;
+
+        poolManager.sync(address(weth));
+        weth.transfer(address(poolManager), amountWeth);
+        poolManager.settle();
+        poolManager.take(address(yuzuToken), distributor, yuzuOut);
+
+        return abi.encode(yuzuOut);
+    }
+
+    /// @dev Pays the PoolManager a negative delta (sync, transfer, settle) or collects a positive one.
+    function _settleOrTake(address currency, int128 delta) internal {
+        if (delta < 0) {
+            poolManager.sync(currency);
+            IERC20(currency).safeTransfer(address(poolManager), uint256(uint128(-delta)));
+            poolManager.settle();
+        } else if (delta > 0) {
+            poolManager.take(currency, address(this), uint256(uint128(delta)));
+        }
+    }
+

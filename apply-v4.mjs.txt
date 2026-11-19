@@ -1,0 +1,119 @@
+import fs from "fs";
+const P = "./";
+const N = "new/";
+const rd = (f) => { const s = fs.readFileSync(P + f, "utf8"); if (s.includes("\r\n")) throw new Error("CRLF in " + f); return s; };
+const nw = (f) => fs.readFileSync(N + f, "utf8");
+const writes = [];
+const once = (s, find, repl, label) => { const i = s.indexOf(find); if (i < 0) throw new Error("NOT FOUND: " + label); if (s.indexOf(find, i + 1) >= 0) throw new Error("NOT UNIQUE: " + label); return s.slice(0, i) + repl + s.slice(i + find.length); };
+const all = (s, find, repl, n, label) => { const parts = s.split(find); if (parts.length - 1 !== n) throw new Error("EXPECTED " + n + " GOT " + (parts.length - 1) + ": " + label); return parts.join(repl); };
+const span = (s, a, b, repl, label) => { const i = s.indexOf(a); if (i < 0) throw new Error("NOT FOUND a: " + label); const j = s.indexOf(b, i + a.length); if (j < 0) throw new Error("NOT FOUND b: " + label); return s.slice(0, i) + repl + s.slice(j); };
+const spanIncl = (s, a, b, repl, label) => { const i = s.indexOf(a); if (i < 0) throw new Error("NOT FOUND a: " + label); const j = s.indexOf(b, i + a.length); if (j < 0) throw new Error("NOT FOUND b: " + label); return s.slice(0, i) + repl + s.slice(j + b.length); };
+
+// ---- YuzuTreasury
+{
+  let t = rd("src/YuzuTreasury.sol");
+  if (t.includes("V4StateLib")) console.log("SKIP treasury (already applied)");
+  else {
+    t = once(t, "    IYuzuRegistry\n} from \"./interfaces/IYuzuV4Interfaces.sol\";", "    IYuzuRegistry,\n    V4StateLib\n} from \"./interfaces/IYuzuV4Interfaces.sol\";", "T import");
+    t = once(t, "    bool public lpLeftoversSwept;\n", "    bool public lpLeftoversSwept;\n    // v4 alignment pass (2026-11-18): liquidity units of the Treasury's permanently locked full-range position\n    uint128 public lockedLiquidity;\n", "T state");
+    t = spanIncl(t, "        uint256 wethToUse = OPENING_WETH_LP;", "        emit PoolOpened(poolId, wethToUse, yuzuToUse);\n", "        (uint256 wethPaid, uint256 yuzuPaid) = _addLiquidity(OPENING_WETH_LP, OPENING_YUZU_LP);\n        emit PoolOpened(poolId, wethPaid, yuzuPaid);\n", "T open");
+    t = spanIncl(t, "        // Read current pool balances to match current pool ratio", "        uint256 poolWeth = yuzuIsCurrency0 ? poolBal1 : poolBal0;\n", "        // Read the locked position's balances at the current price to match the pool ratio\n        (uint256 poolYuzu, uint256 poolWeth) = _getPoolBalances();\n", "T site1");
+    t = spanIncl(t, "        lpReserveWethPending -= wethToUse;", "        emit MintLiquidityAdded(wethToUse, yuzuToUse, totalYuzuAddedToLp);\n", "        (uint256 wethPaid, uint256 yuzuPaid) = _addLiquidity(wethToUse, yuzuToUse);\n        emit MintLiquidityAdded(wethPaid, yuzuPaid, totalYuzuAddedToLp);\n", "T add");
+    t = spanIncl(t, "        (uint256 poolBal0, uint256 poolBal1) =", "        uint256 poolYuzu = yuzuIsCurrency0 ? poolBal0 : poolBal1;\n", "        (uint256 poolYuzu,) = _getPoolBalances();\n", "T site2");
+    t = spanIncl(t, "        (uint256 poolBal0, uint256 poolBal1) =", "        uint256 poolWeth = yuzuIsCurrency0 ? poolBal1 : poolBal0;\n", "        (, uint256 poolWeth) = _getPoolBalances();\n", "T site3");
+    t = once(t, "        (wethFees, yuzuFees) = abi.decode(res, (uint256, uint256));", "        (,, wethFees, yuzuFees) = abi.decode(res, (uint256, uint256, uint256, uint256));", "T collect decode");
+    t = spanIncl(t, "        uint256 wethToDist = wethFees / 2;", "        emit LpFeesCollected(wethToDist, wethToTreas, yuzuFees);\n", "        _distributeLpFees(wethFees, yuzuFees);\n", "T collect split");
+    const sweep = "    /// @notice Sweeps leftover LP-reserve $YUZU into the Ecosystem Vault";
+    t = once(t, sweep, nw("treasury_helpers.txt") + sweep, "T helpers");
+    t = span(t, "    function unlockCallback(bytes calldata data) external override returns (bytes memory) {", "    receive() external payable {}", nw("treasury_callback.txt"), "T callback");
+    if (/poolManager[.]getPositionBalances|poolBal0|settle\(address/.test(t)) throw new Error("T leftovers");
+    writes.push(["src/YuzuTreasury.sol", t]);
+  }
+}
+
+// ---- YuzuPoolHook
+{
+  let h = rd("src/YuzuPoolHook.sol");
+  if (h.includes("V4StateLib")) console.log("SKIP hook");
+  else {
+    h = once(h, "IHooks, IYuzuUnits} from", "IHooks, IYuzuUnits, V4StateLib} from", "H import");
+    h = all(h, "(, int24 currentTick,,) = poolManager.getSlot0(poolId);", "(, int24 currentTick) = V4StateLib.getSlot0(poolManager, poolId);", 4, "H reads");
+    h = once(h, "(, currentTick,,) = poolManager.getSlot0(poolId);", "(, currentTick) = V4StateLib.getSlot0(poolManager, poolId);", "H read 5");
+    if (/poolManager\.getSlot0/.test(h)) throw new Error("H leftovers");
+    writes.push(["src/YuzuPoolHook.sol", h]);
+  }
+}
+
+// ---- YuzuSocketBay
+{
+  let s = rd("src/YuzuSocketBay.sol");
+  if (s.includes("V4StateLib")) console.log("SKIP socket bay");
+  else {
+    s = once(s, "    IWETH,\n    IYuzuUnits\n} from", "    IWETH,\n    IYuzuUnits,\n    V4StateLib\n} from", "S import");
+    s = once(s, "            sqrtPriceLimitX96: 0\n", "            sqrtPriceLimitX96: zeroForOne ? V4StateLib.MIN_SQRT_PRICE_PLUS_ONE : V4StateLib.MAX_SQRT_PRICE_MINUS_ONE\n", "S limit");
+    s = once(s, "        (int256 delta0, int256 delta1) = poolManager.swap(poolKey, params, \"\");", "        (int128 delta0, int128 delta1) = V4StateLib.unpackDelta(poolManager.swap(poolKey, params, \"\"));", "S swap");
+    s = once(s, "        weth.transfer(address(poolManager), wethNeeded);", "        poolManager.sync(address(weth));\n        weth.transfer(address(poolManager), wethNeeded);", "S sync");
+    s = once(s, "        poolManager.settle(address(weth));", "        poolManager.settle();", "S settle");
+    writes.push(["src/YuzuSocketBay.sol", s]);
+  }
+}
+
+// ---- YuzuSwapRouterAdapter
+{
+  let a = rd("src/adapters/YuzuSwapRouterAdapter.sol");
+  if (a.includes("V4StateLib")) console.log("SKIP adapter");
+  else {
+    a = once(a, "    SwapParams\n} from \"../interfaces/IYuzuV4Interfaces.sol\";", "    SwapParams,\n    V4StateLib\n} from \"../interfaces/IYuzuV4Interfaces.sol\";", "A import");
+    a = once(a, "        (int256 delta0, int256 delta1) = poolManager.swap(", "        int256 swapDelta = poolManager.swap(", "A swap");
+    a = once(a, "        int256 outDelta = zeroForOne ? delta1 : delta0;", "        (int128 delta0, int128 delta1) = V4StateLib.unpackDelta(swapDelta);\n        int256 outDelta = zeroForOne ? delta1 : delta0;", "A unpack");
+    a = once(a, "        IERC20(h.tokenIn).safeTransfer(address(poolManager), amountIn);", "        poolManager.sync(h.tokenIn);\n        IERC20(h.tokenIn).safeTransfer(address(poolManager), amountIn);", "A sync");
+    a = once(a, "        poolManager.settle(h.tokenIn);", "        poolManager.settle();", "A settle");
+    writes.push(["src/adapters/YuzuSwapRouterAdapter.sol", a]);
+  }
+}
+
+// ---- test/YuzuPhase1.t.sol
+{
+  let p = rd("test/YuzuPhase1.t.sol");
+  if (p.includes("V4StateLib")) console.log("SKIP phase1 test");
+  else {
+    p = once(p, "import {PoolKey, SwapParams, ModifyLiquidityParams, IUnlockCallback} from", "import {PoolKey, SwapParams, ModifyLiquidityParams, IUnlockCallback, V4StateLib} from", "P1 import");
+    p = span(p, "    function unlockCallback(bytes calldata data) external override returns (bytes memory) {", "contract YuzuPhase1Test is Test {", nw("phase1_swapper_cb.txt"), "P1 swapper");
+    p = once(p, "    uint160 constant OPENING_SQRT_PRICE_X96 = 79228162514264337593543950336; // 1:1 scaled placeholder", "    // CHANGE (bankr 2026-11-18, v4 alignment): the pool now takes real liquidity units, so the test opens it at\n    // the deploy script's price (0.0225 WETH : 150,000 $YUZU) instead of a 1:1 placeholder. Set in setUp.\n    uint160 OPENING_SQRT_PRICE_X96;", "P1 price");
+    p = once(p, "        units = new MockYuzuUnits();\n", "        units = new MockYuzuUnits();\n        OPENING_SQRT_PRICE_X96 = address(yuzu) < address(weth)\n            ? uint160((uint256(15_000) << 96) / 38_729_833)\n            : uint160((uint256(38_729_833) << 96) / 15_000);\n", "P1 price set");
+    p = once(p, "        assertEq(treasury.totalYuzuAddedToLp(), 300_000e18);", "        // CHANGE (v4 alignment): the LP reserve is debited by what the position actually took (rounding stays in it)\n        assertApproxEqAbs(treasury.totalYuzuAddedToLp(), 300_000e18, 1e17);", "P1 assert 1");
+    p = once(p, "        assertEq(treasury.lpReserveYuzuRemaining(), 250_000_000e18 - 300_000e18);", "        assertEq(treasury.lpReserveYuzuRemaining(), 250_000_000e18 - treasury.totalYuzuAddedToLp());", "P1 assert 2");
+    writes.push(["test/YuzuPhase1.t.sol", p]);
+  }
+}
+
+// ---- test/YuzuAdapters.t.sol
+{
+  let a = rd("test/YuzuAdapters.t.sol");
+  if (a.includes("FullRangeLpHelper")) console.log("SKIP adapters test");
+  else {
+    a = once(a, "import {MockV4PoolManager, MockWETH} from \"./mocks/Phase1Mocks.sol\";", "import {MockV4PoolManager, MockWETH, FullRangeLpHelper} from \"./mocks/Phase1Mocks.sol\";", "AD import");
+    a = once(a, "contract YuzuAdaptersTest is Test, IUnlockCallback {", "contract YuzuAdaptersTest is Test {", "AD contract");
+    a = span(a, "        poolManager.initialize(qKey, 2 ** 96);", "    /// @dev ADDED (bankr 2026-11-18): the mock pool's current reserves.", nw("adapters_setup_tail.txt"), "AD setup");
+    writes.push(["test/YuzuAdapters.t.sol", a]);
+  }
+}
+
+// ---- test/YuzuFull17Integration.t.sol
+{
+  let f = rd("test/YuzuFull17Integration.t.sol");
+  if (f.includes("FullRangeLpHelper")) console.log("SKIP full17 test");
+  else {
+    f = once(f, "import {MockV4PoolManager, MockWETH} from \"./mocks/Phase1Mocks.sol\";", "import {MockV4PoolManager, MockWETH, FullRangeLpHelper} from \"./mocks/Phase1Mocks.sol\";", "F import");
+    f = once(f, "contract YuzuFull17IntegrationTest is Test, IUnlockCallback {", "contract YuzuFull17IntegrationTest is Test {", "F contract");
+    f = span(f, "        poolManager.initialize(qKey, 2 ** 96);", "    function _assertSizes(", nw("full17_pool_tail.txt"), "F pool");
+    f = once(f, "        assertEq(yuzuIs0 ? reserve0 : reserve1, 150_000e18, \"pool $YUZU\");", "        // CHANGE (v4 alignment): real liquidity units round a few wei under the two amounts\n        assertApproxEqAbs(yuzuIs0 ? reserve0 : reserve1, 150_000e18, 1e17, \"pool $YUZU\");", "F assert yuzu");
+    f = once(f, "        assertEq(yuzuIs0 ? reserve1 : reserve0, 0.0225 ether, \"pool WETH\");", "        assertApproxEqAbs(yuzuIs0 ? reserve1 : reserve0, 0.0225 ether, 1e6, \"pool WETH\");", "F assert weth");
+    writes.push(["test/YuzuFull17Integration.t.sol", f]);
+  }
+}
+
+writes.push(["src/interfaces/IYuzuV4Interfaces.sol", nw("IYuzuV4Interfaces.sol")]);
+writes.push(["test/mocks/Phase1Mocks.sol", nw("Phase1Mocks.sol")]);
+writes.push(["test/YuzuInkFork.t.sol", nw("YuzuInkFork.t.sol")]);
+for (const [f, s] of writes) { fs.writeFileSync(P + f, s); console.log("WROTE " + f + " (" + s.length + " chars)"); }
